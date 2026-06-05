@@ -1,0 +1,23 @@
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    DATABASE_URL: str
+    IFRUTI_URL: str
+    IFRUTI_EMAIL: str
+    IFRUTI_PASSWORD: str
+    SPREADSHEET_ID: str
+    GOOGLE_SERVICE_ACCOUNT_EMAIL: str
+    GOOGLE_PRIVATE_KEY: str
+    FRONTEND_URL: str = "https://app.hayashi.asynnc.cloud"
+
+    JWT_SECRET_KEY: str
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = 480  # 8 horas
+
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
+
+
+settings = Settings()

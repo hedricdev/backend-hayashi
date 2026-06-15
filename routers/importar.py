@@ -75,7 +75,7 @@ async def importar_lista_diaria():
     msg_queue, messages, iniciado_em, put = _build_sse_runner("lista_diaria")
 
     def run_scraper():
-        loop = asyncio.ProactorEventLoop()
+        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         async def _run():

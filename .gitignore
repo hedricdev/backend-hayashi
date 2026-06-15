@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-alembic/versions/
+# NAO ignore as migracoes — elas precisam ir pro deploy (sem elas o
+# `alembic upgrade head` nao cria as tabelas no container).
+alembic/versions/__pycache__/

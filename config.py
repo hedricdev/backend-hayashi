@@ -4,7 +4,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     DATABASE_URL: str
     IFRUTI_URL: str
-    IFRUTI_EMAIL: str
+    IFRUTI_CPF: str
+    IFRUTI_EMPRESA: str
     IFRUTI_PASSWORD: str
     SPREADSHEET_ID: str
     GOOGLE_SERVICE_ACCOUNT_EMAIL: str

@@ -321,15 +321,82 @@ def marcar_como_importado(aba: str, linha_numero: int, ifruti_id: str) -> None:
 
 
 def get_aba_atual() -> str:
-    """Retorna a aba do dia corrente. Após 12h aponta para o dia seguinte."""
+    """Retorna a aba do dia corrente. Após 12h aponta para o dia seguinte.
+    Usado para a lista diária (compras): após 12h já aponta para o próximo dia.
+    """
     brasilia = pytz.timezone("America/Sao_Paulo")
     agora = datetime.now(brasilia)
     if agora.hour >= 12:
         agora += timedelta(days=1)
-    # weekday(): 0=seg..6=dom → mapeia para índice em DIAS_SEMANA
     idx = (agora.weekday() + 1) % 7  # 0=dom, 1=seg, ..., 6=sab
+    return DIAS_SEMANA[idx]
+
+
+def get_aba_venda_atual() -> str:
+    """Retorna a aba do dia atual para importação de vendas.
+    Sempre retorna o dia corrente, sem adiantar para o próximo.
+    As vendas são do dia em que foram feitas, independente do horário.
+    """
+    brasilia = pytz.timezone("America/Sao_Paulo")
+    agora = datetime.now(brasilia)
+    idx = (agora.weekday() + 1) % 7
     return DIAS_SEMANA[idx]
 
 
 def get_aba_semana_atual() -> list[str]:
     return DIAS_SEMANA
+
+
+def get_lista_diaria(aba: str | None = None) -> list[dict]:
+    """Lê as compras do dia a partir das linhas 2 (custo) e 3 (quantidade).
+
+    Retorna lista de {produto, quantidade, valor, fornecedor}.
+    Ignora produtos sem quantidade ou sem custo preenchido.
+    """
+    if aba is None:
+        aba = get_aba_atual()
+
+    service = get_sheets_client()
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=settings.SPREADSHEET_ID, range=f"'{aba}'!A2:AZ4")
+        .execute()
+    )
+    rows = result.get("values", [])
+    if len(rows) < 3:
+        return []
+
+    row_custo = rows[0]       # linha 2 — custo real por caixa
+    row_qtde = rows[1]        # linha 3 — quantidade comprada
+    row_cabecalho = rows[2]   # linha 4 — nomes dos produtos
+
+    col_pagamento = next(
+        (i for i, h in enumerate(row_cabecalho) if normaliza(h) in {"DIN/PIX", "DIN/CHQ"}),
+        None,
+    )
+    limite = col_pagamento if col_pagamento is not None else len(row_cabecalho)
+
+    itens: list[dict] = []
+    for j in range(1, limite):
+        nome = row_cabecalho[j].strip() if j < len(row_cabecalho) else ""
+        if not nome:
+            continue
+        qtd_str = row_qtde[j].strip() if j < len(row_qtde) else ""
+        custo_str = row_custo[j].strip() if j < len(row_custo) else ""
+        if not qtd_str or not custo_str:
+            continue
+        try:
+            qtd = int(float(qtd_str))
+        except ValueError:
+            continue
+        if qtd <= 0:
+            continue
+        itens.append({
+            "produto": nome,
+            "quantidade": qtd,
+            "valor": custo_str.replace(",", "."),
+            "fornecedor": None,
+        })
+
+    return itens

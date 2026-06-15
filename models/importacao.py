@@ -15,6 +15,7 @@ class Importacao(Base):
     total_importado = Column(Integer, default=0)
     total_erro = Column(Integer, default=0)
     log = Column(Text, nullable=True)
+    tipo = Column(String(20), nullable=True, default="lista_diaria")
 
 
 class ClienteVendedor(Base):

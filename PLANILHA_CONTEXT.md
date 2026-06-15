@@ -54,10 +54,6 @@ function normaliza(str) {
     .toUpperCase();
 }
 
-// Busca dinâmica — sempre use assim
-const cabecalho = // array com valores da linha 4 (A4:Z4 ou além)
-
-const colProdutoIndex = cabecalho.findIndex(h => normaliza(h) === normaliza('1A COOP'));
 const colPagamentoIndex = cabecalho.findIndex(h => 
   normaliza(h) === normaliza('Din/Pix') || normaliza(h) === normaliza('Din/Chq')
 );
@@ -72,7 +68,7 @@ const colVendedorIndex = cabecalho.findIndex(h => normaliza(h) === normaliza('VE
 ```javascript
 function colToLetter(index) {
   let letter = '';
-  let n = index + 1; // índice 0 = coluna A
+  let n = index + 1;
   while (n > 0) {
     const rem = (n - 1) % 26;
     letter = String.fromCharCode(65 + rem) + letter;
@@ -80,7 +76,6 @@ function colToLetter(index) {
   }
   return letter;
 }
-// Exemplos: índice 0 = A, índice 1 = B, índice 25 = Z, índice 26 = AA
 ```
 
 ---
@@ -110,7 +105,7 @@ const aba = dias[brasilia.getDay()];
 - Cada linha a partir da linha 5 é um cliente
 - O nome do cliente fica na **coluna A**
 - Clientes novos são inseridos dinamicamente antes da primeira linha vazia após os clientes existentes
-- Linhas a ignorar ao buscar clientes: `TOTAL`, `COMPRAS`, `DIFERENÇA`, `DIFERENCA`, linhas vazias
+- Linhas a ignorar: `TOTAL`, `COMPRAS`, `DIFERENÇA`, `DIFERENCA`, linhas vazias
 
 ### Vendas
 - Cada célula no cruzamento de linha (cliente) e coluna (produto) contém a **quantidade vendida**
@@ -123,12 +118,169 @@ const aba = dias[brasilia.getDay()];
 - **Custo na roça** = valor que o Michael paga ao fornecedor
 - **Custo real** = custo na roça + R$6,00 (frete fixo por caixa)
 - O que entra na linha 2 da planilha é o **custo real**
-- Ex: Michael paga R$34,00 → planilha registra R$40,00
 
 ### Coluna VENDEDOR
 - Sempre a última coluna, logo após `SAÍDA`
-- Adicionada manualmente no cabeçalho (linha 4) de cada aba
 - Gravada automaticamente pela automação n8n a cada venda
+
+---
+
+## Relatórios e Métricas
+
+### Como calcular faturamento
+
+O campo `PREÇOS` armazena o preço como string, podendo ser múltiplos valores separados por `/` quando o cliente comprou mais de um produto.
+
+**CRÍTICO:** O preço na coluna PREÇOS corresponde ao preço de cada produto na ordem em que foram vendidos. Não é possível associar preço a produto específico com 100% de certeza — use o faturamento estimado como aproximação.
+
+```python
+def parse_precos(preco_str: str) -> list[float]:
+    """Converte '110/90/50' em [110.0, 90.0, 50.0]"""
+    if not preco_str:
+        return []
+    try:
+        return [float(p.strip()) for p in preco_str.split('/') if p.strip()]
+    except:
+        return []
+
+def calcular_faturamento(venda: dict) -> float:
+    """
+    Calcula faturamento estimado de uma venda.
+    Multiplica cada preço pela quantidade do produto correspondente (por ordem).
+    Se número de preços != número de produtos, usa média dos preços × total de caixas.
+    """
+    precos = parse_precos(venda.get('preco', ''))
+    produtos = venda.get('produtos', [])
+    
+    if not precos or not produtos:
+        return 0.0
+    
+    if len(precos) == len(produtos):
+        return sum(p['quantidade'] * precos[i] for i, p in enumerate(produtos))
+    else:
+        media = sum(precos) / len(precos)
+        total_caixas = sum(p['quantidade'] for p in produtos)
+        return media * total_caixas
+```
+
+### Relatórios disponíveis
+
+#### 1. Ranking de vendedores
+```python
+def ranking_vendedores(vendas: list[dict]) -> list[dict]:
+    from collections import defaultdict
+    ranking = defaultdict(lambda: {'caixas': 0, 'faturamento': 0.0, 'vendas': 0})
+    
+    for venda in vendas:
+        v = venda['vendedor']
+        ranking[v]['caixas'] += sum(p['quantidade'] for p in venda['produtos'])
+        ranking[v]['faturamento'] += calcular_faturamento(venda)
+        ranking[v]['vendas'] += 1
+    
+    return sorted(
+        [{'vendedor': k, **v} for k, v in ranking.items()],
+        key=lambda x: x['caixas'],
+        reverse=True
+    )
+```
+
+#### 2. Ranking de clientes
+```python
+def ranking_clientes(vendas: list[dict]) -> list[dict]:
+    from collections import defaultdict
+    ranking = defaultdict(lambda: {'caixas': 0, 'faturamento': 0.0, 'dias_comprou': set()})
+    
+    for venda in vendas:
+        c = venda['cliente']
+        ranking[c]['caixas'] += sum(p['quantidade'] for p in venda['produtos'])
+        ranking[c]['faturamento'] += calcular_faturamento(venda)
+        ranking[c]['dias_comprou'].add(venda['dia'])
+    
+    return sorted(
+        [{'cliente': k, 'caixas': v['caixas'], 'faturamento': v['faturamento'],
+          'frequencia': len(v['dias_comprou'])} for k, v in ranking.items()],
+        key=lambda x: x['caixas'],
+        reverse=True
+    )
+```
+
+#### 3. Produtos mais vendidos
+```python
+def produtos_mais_vendidos(vendas: list[dict]) -> list[dict]:
+    from collections import defaultdict
+    produtos = defaultdict(int)
+    
+    for venda in vendas:
+        for p in venda['produtos']:
+            produtos[p['nome']] += p['quantidade']
+    
+    return sorted(
+        [{'produto': k, 'quantidade': v} for k, v in produtos.items()],
+        key=lambda x: x['quantidade'],
+        reverse=True
+    )
+```
+
+#### 4. Caixas por dia da semana
+```python
+def caixas_por_dia(vendas: list[dict]) -> list[dict]:
+    from collections import defaultdict
+    por_dia = defaultdict(int)
+    
+    for venda in vendas:
+        por_dia[venda['dia']] += sum(p['quantidade'] for p in venda['produtos'])
+    
+    ordem = ['SEGUNDA', 'TERÇA', 'QUARTA', 'QUINTA', 'SEXTA', 'SABADO', 'DOMINGO']
+    return [{'dia': d, 'caixas': por_dia.get(d, 0)} for d in ordem]
+```
+
+#### 5. Vendas em aberto (sem pagamento informado)
+```python
+def vendas_em_aberto(vendas: list[dict]) -> list[dict]:
+    return [
+        v for v in vendas
+        if not v.get('pagamento') or v['pagamento'].strip() == ''
+    ]
+```
+
+#### 6. Mix de pagamento
+```python
+def mix_pagamento(vendas: list[dict]) -> dict:
+    from collections import Counter
+    pagamentos = [v.get('pagamento', '').upper().strip() or 'EM ABERTO' for v in vendas]
+    total = len(pagamentos)
+    counter = Counter(pagamentos)
+    return {k: {'count': v, 'percentual': round(v/total*100, 1)} for k, v in counter.items()}
+```
+
+#### 7. Clientes que não compraram essa semana
+```python
+def clientes_inativos(vendas_semana: list[dict], todos_clientes: list[str]) -> list[str]:
+    """
+    todos_clientes: lista de clientes da coluna A da planilha
+    vendas_semana: vendas registradas essa semana
+    """
+    compraram = {v['cliente'] for v in vendas_semana}
+    return [c for c in todos_clientes if c not in compraram]
+```
+
+### Endpoints sugeridos no FastAPI
+
+```
+GET /api/vendas?semana=atual|passada&vendedor=X&dia=SEGUNDA
+GET /api/relatorios/ranking-vendedores?semana=atual
+GET /api/relatorios/ranking-clientes?semana=atual
+GET /api/relatorios/produtos-mais-vendidos?semana=atual
+GET /api/relatorios/caixas-por-dia?semana=atual
+GET /api/relatorios/vendas-em-aberto?semana=atual
+GET /api/relatorios/mix-pagamento?semana=atual
+GET /api/relatorios/clientes-inativos?semana=atual
+```
+
+### Fonte de dados por período
+- **semana=atual** → lê direto da planilha Google Sheets
+- **semana=passada** → lê do PostgreSQL (tabela vendas_historico)
+- **semana=personalizado&inicio=YYYY-MM-DD&fim=YYYY-MM-DD** → lê do PostgreSQL
 
 ---
 
@@ -138,7 +290,7 @@ const aba = dias[brasilia.getDay()];
 
 ```
 # Cabeçalho da aba (linha 4)
-GET .../values/{aba}!A4:Z4
+GET .../values/{aba}!A4:AZ4
 
 # Lista de clientes (coluna A inteira)  
 GET .../values/{aba}!A:A
@@ -170,37 +322,12 @@ Body: { requests: [{ insertDimension: { range: { sheetId, dimension: "ROWS", sta
 | SABADO | 715708557 |
 | DOMINGO | 309564564 |
 
-### CRÍTICO ao ler dados da planilha no Next.js
+### CRÍTICO ao ler dados da planilha
 
 - **Nunca assuma índices de coluna fixos** — leia sempre o cabeçalho primeiro
-- A linha 4 pode ter colunas extras dependendo do dia — use `A4:Z4` ou `A4:AZ4` para garantir
-- Ao agregar dados da semana, leia aba por aba e some os valores
+- Use `A4:AZ4` para garantir que captura todas as colunas
 - Só considere como venda válida: linhas onde a coluna VENDEDOR está preenchida
 - Ignorar sempre: linhas 1-4, linhas com TOTAL, COMPRAS, DIFERENÇA, linhas vazias
-
----
-
-## Exemplo de leitura agregada (para o dashboard)
-
-```javascript
-// Para cada aba da semana:
-// 1. Busca cabeçalho (linha 4) → descobre índice de cada coluna
-// 2. Busca todas as linhas a partir da linha 5
-// 3. Filtra linhas onde coluna VENDEDOR está preenchida
-// 4. Para cada linha válida, extrai os dados de venda
-
-// Estrutura de uma venda extraída:
-{
-  cliente: string,        // coluna A
-  vendedor: string,       // coluna VENDEDOR
-  pagamento: string,      // coluna Din/Pix ou Din/Chq
-  precos: string,         // coluna PREÇOS (pode ser "110/90" para múltiplos produtos)
-  produtos: [             // para cada coluna de produto com valor > 0
-    { nome: string, quantidade: number }
-  ],
-  dia: string             // nome da aba (SEGUNDA, TERÇA, etc.)
-}
-```
 
 ---
 
@@ -233,7 +360,6 @@ sheet = service.spreadsheets()
 import unicodedata
 
 def normaliza(s: str) -> str:
-    """Remove acentos, espaços extras e converte para maiúsculas."""
     if not s:
         return ''
     s = unicodedata.normalize('NFD', s)
@@ -241,7 +367,6 @@ def normaliza(s: str) -> str:
     return ' '.join(s.split()).upper()
 
 def col_to_letter(index: int) -> str:
-    """Converte índice 0-based para letra de coluna (0=A, 1=B, 25=Z, 26=AA)."""
     letter = ''
     n = index + 1
     while n > 0:
@@ -260,29 +385,13 @@ def get_cabecalho(aba: str) -> list[str]:
     ).execute()
     values = result.get('values', [[]])
     return values[0] if values else []
-
-# Uso:
-cabecalho = get_cabecalho('TERCA')
-col_produto = next((i for i, h in enumerate(cabecalho) if normaliza(h) == normaliza('1A COOP')), None)
-col_pagamento = next((i for i, h in enumerate(cabecalho) if normaliza(h) in ['DIN/PIX', 'DIN/CHQ']), None)
-col_preco = next((i for i, h in enumerate(cabecalho) if normaliza(h) in ['PRECOS', 'PRECO']), None)
-col_vendedor = next((i for i, h in enumerate(cabecalho) if normaliza(h) == 'VENDEDOR'), None)
 ```
 
 ### Leitura de todas as linhas da aba
 ```python
-def get_linhas(aba: str) -> list[list]:
-    result = sheet.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{aba}'!A:AZ"
-    ).execute()
-    return result.get('values', [])
-
-# Linhas a ignorar
 LABELS_IGNORAR = {'TOTAL', 'COMPRAS', 'DIFERENCA', 'DIFERENÇA'}
 
 def is_linha_valida(row: list, col_vendedor: int) -> bool:
-    """Retorna True se a linha é uma venda válida registrada pela automação."""
     if not row or not row[0].strip():
         return False
     if normaliza(row[0]) in LABELS_IGNORAR:
@@ -294,23 +403,13 @@ def is_linha_valida(row: list, col_vendedor: int) -> bool:
     return True
 ```
 
-### Leitura agregada da semana (para o dashboard)
+### Leitura agregada da semana
 ```python
-from datetime import datetime
-import pytz
-
-DIAS = ['DOMINGO', 'SEGUNDA', 'TERCA', 'QUARTA', 'QUINTA', 'SEXTA', 'SABADO']
-
-def get_aba_atual() -> str:
-    brasilia = pytz.timezone('America/Sao_Paulo')
-    agora = datetime.now(brasilia)
-    if agora.hour >= 12:
-        agora = agora.replace(day=agora.day + 1)
-    return DIAS[agora.weekday() + 1 if agora.weekday() < 6 else 0]
-
 def get_vendas_semana() -> list[dict]:
+    DIAS = ['SEGUNDA', 'TERÇA', 'QUARTA', 'QUINTA', 'SEXTA', 'SABADO', 'DOMINGO']
     vendas = []
-    for aba in DIAS[1:]:  # SEGUNDA a SABADO
+    
+    for aba in DIAS:
         try:
             cabecalho = get_cabecalho(aba)
             if not cabecalho:
@@ -320,62 +419,37 @@ def get_vendas_semana() -> list[dict]:
             col_pagamento = next((i for i, h in enumerate(cabecalho) if normaliza(h) in ['DIN/PIX', 'DIN/CHQ']), None)
             col_preco = next((i for i, h in enumerate(cabecalho) if normaliza(h) in ['PRECOS', 'PRECO']), None)
 
-            linhas = get_linhas(aba)
+            result = sheet.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{aba}'!A:AZ"
+            ).execute()
+            linhas = result.get('values', [])
 
-            for i, row in enumerate(linhas[4:], start=5):  # pula linhas 1-4
+            for row in linhas[4:]:
                 if not is_linha_valida(row, col_vendedor):
                     continue
 
-                cliente = row[0].strip()
-                vendedor = row[col_vendedor] if col_vendedor and col_vendedor < len(row) else ''
-                pagamento = row[col_pagamento] if col_pagamento and col_pagamento < len(row) else ''
-                preco = row[col_preco] if col_preco and col_preco < len(row) else ''
-
-                # Produtos vendidos (colunas 1 até col_pagamento-1)
                 produtos = []
                 for j in range(1, col_pagamento or len(row)):
                     if j < len(cabecalho) and j < len(row):
-                        nome_produto = cabecalho[j].strip()
+                        nome = cabecalho[j].strip()
                         qtd = row[j]
-                        if nome_produto and qtd and str(qtd).strip().isdigit():
-                            produtos.append({
-                                'nome': nome_produto,
-                                'quantidade': int(qtd)
-                            })
+                        if nome and qtd and str(qtd).strip().isdigit():
+                            produtos.append({'nome': nome, 'quantidade': int(qtd)})
 
                 if produtos:
                     vendas.append({
-                        'cliente': cliente,
-                        'vendedor': vendedor,
-                        'pagamento': pagamento,
-                        'preco': preco,
+                        'cliente': row[0].strip(),
+                        'vendedor': row[col_vendedor] if col_vendedor and col_vendedor < len(row) else '',
+                        'pagamento': row[col_pagamento] if col_pagamento and col_pagamento < len(row) else '',
+                        'preco': row[col_preco] if col_preco and col_preco < len(row) else '',
                         'produtos': produtos,
                         'dia': aba
                     })
         except Exception as e:
             print(f"Erro ao ler aba {aba}: {e}")
-            continue
 
     return vendas
-```
-
-### Gravação em lote
-```python
-def gravar_celulas(dados: list[dict]) -> dict:
-    """
-    dados = [
-        {'range': 'TERCA!B5', 'values': [[30]]},
-        {'range': 'TERCA!Q5', 'values': [['PIX']]},
-    ]
-    """
-    body = {
-        'valueInputOption': 'RAW',
-        'data': dados
-    }
-    return sheet.values().batchUpdate(
-        spreadsheetId=SPREADSHEET_ID,
-        body=body
-    ).execute()
 ```
 
 ### Variáveis de ambiente necessárias
@@ -384,4 +458,4 @@ SPREADSHEET_ID=1YeSqoZjU4npt8f0-jkzuieHK31J1dD7S4jt4ABD8SFI
 GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
 ```
 
-> **Nota:** Prefira passar o JSON completo como string na variável de ambiente em vez de um arquivo, facilita o deploy no EasyPanel.
+> **Nota:** Passe o JSON completo como string na variável de ambiente — facilita o deploy no EasyPanel.

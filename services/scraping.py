@@ -76,9 +76,9 @@ class IFrutiScraper:
         await self._autenticar()
         return self
 
-    def _attach_debug_listeners(self):
+    def _attach_debug_listeners(self, page: Page | None = None):
         """Captura console e respostas de rede da página para diagnóstico."""
-        page = self._page
+        page = page or self._page
 
         def on_console(msg):
             self.page_logs.append(f"[console.{msg.type}] {msg.text}")
@@ -446,6 +446,115 @@ class IFrutiScraper:
         await page.wait_for_selector("a:has-text('Distribuidora')", state="visible", timeout=5000)
         await page.click("a:has-text('Distribuidora')")
         await page.wait_for_selector("#btnNovaCompra", state="visible", timeout=15000)
+
+    # -------------------------------------------------------------------------
+    # Fluxo 3 — Exportação de vendas por período (Distribuidora > Exportar Excel)
+    # -------------------------------------------------------------------------
+
+    async def exportar_vendas_periodo(self, data_inicio: str, data_fim: str) -> bytes:
+        """Exporta o relatório de vendas da Distribuidora num período.
+
+        data_inicio/data_fim no formato dd/mm/aaaa. Usado para sincronizar
+        vendas_historico sob demanda.
+
+        O filtro de data é aplicado do lado da sessão pelo botão "Consultar"
+        (#btnDstr, submit real de formulário) — sem isso, a exportação ignora
+        as datas e devolve uma tabela vazia. Depois de consultar, o botão
+        "Exportar Excel" abre uma aba nova que baixa o arquivo e fecha quase
+        instantaneamente — rápido demais pra capturar via evento de
+        download/popup do Playwright de forma confiável. Em vez de depender
+        desse clique, batemos direto no endpoint que ele chama (confirmado
+        pelo usuário: AdminDstr?opcao=exportarExcel), reaproveitando os
+        cookies de sessão já autenticados no contexto do browser — a essa
+        altura já com o filtro de data aplicado.
+
+        Retorna os bytes do .xls (na prática HTML — mesmo formato que
+        parse_ifruti_xls já sabe ler).
+        """
+        page = self._page
+        await self._navegar_distribuidora()
+
+        await page.wait_for_selector("#dataInicial", state="attached", timeout=15000)
+        await page.fill("#dataInicial", data_inicio, force=True)
+        await page.dispatch_event("#dataInicial", "change")
+        await page.dispatch_event("#dataInicial", "input")
+
+        await page.wait_for_selector("#dataFinal", state="attached", timeout=15000)
+        await page.fill("#dataFinal", data_fim, force=True)
+        await page.dispatch_event("#dataFinal", "change")
+        await page.dispatch_event("#dataFinal", "input")
+
+        await page.wait_for_selector("#btnDstr", state="visible", timeout=15000)
+        await page.click("#btnDstr")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        resp = await self._context.request.get(
+            f"{settings.IFRUTI_URL}/AdminDstr",
+            params={
+                "opcao": "exportarExcel",
+                "dataInicial": data_inicio,
+                "dataFinal": data_fim,
+            },
+        )
+        if not resp.ok:
+            raise Exception(f"Requisição de exportação falhou: HTTP {resp.status}")
+        return await resp.body()
+
+    async def exportar_vendas_em_aberto(self) -> bytes:
+        """Exporta TODAS as vendas atualmente em aberto no iFruti, sem filtro de data.
+
+        A tela Distribuidora tem um select "situacao" (#situacao, plugin
+        Chosen) com as opções: 0=Vendas (todas), 1=Em Aberto, 2=Em Atraso,
+        3=Recebido. Ao selecionar "Em Aberto", o campo de datas trava em
+        hoje e o filtro de data é ignorado pelo servidor — a exportação
+        devolve tudo que está em aberto até agora, independente de quando a
+        venda foi feita.
+
+        Isso permite reconciliar fiado antigo sem depender de uma janela de
+        datas (diferente de exportar_vendas_periodo): quem estava em aberto
+        no nosso banco e sumiu dessa lista foi pago.
+
+        Mesmo padrão de exportar_vendas_periodo: aplica o filtro via
+        "Consultar" (#btnDstr) e bate direto na URL de exportação
+        reaproveitando os cookies de sessão do contexto do browser.
+        """
+        page = self._page
+        await self._navegar_distribuidora()
+
+        await page.wait_for_selector("#situacao", state="attached", timeout=15000)
+        resultado = await page.evaluate(
+            """() => {
+                const sel = document.querySelector('#situacao');
+                if (!sel) return 'ERR:select situacao não encontrado';
+                const opt = Array.from(sel.options).find(o => o.value === '1');
+                if (!opt) return 'ERR:opção Em Aberto (value=1) não encontrada';
+                sel.value = opt.value;
+                const jq = window.jQuery || window.$ || null;
+                if (jq) jq(sel).trigger('change').trigger('chosen:updated');
+                else sel.dispatchEvent(new Event('change', { bubbles: true }));
+                return 'OK';
+            }"""
+        )
+        if resultado != "OK":
+            raise Exception(resultado.replace("ERR:", "", 1))
+
+        await page.wait_for_selector("#btnDstr", state="visible", timeout=15000)
+        await page.click("#btnDstr")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        resp = await self._context.request.get(
+            f"{settings.IFRUTI_URL}/AdminDstr",
+            params={"opcao": "exportarExcel"},
+        )
+        if not resp.ok:
+            raise Exception(f"Requisição de exportação falhou: HTTP {resp.status}")
+        return await resp.body()
 
     async def _preencher_form_venda(
         self, cliente: str, produto: str, quantidade: int, valor: str,

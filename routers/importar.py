@@ -20,7 +20,7 @@ async def importar_lista_diaria():
     msg_queue, messages, iniciado_em, put = build_sse_runner()
 
     def run_scraper():
-        loop = asyncio.ProactorEventLoop()
+        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         async def _run():
@@ -61,7 +61,7 @@ async def importar_vendas():
     msg_queue, messages, iniciado_em, put = build_sse_runner()
 
     def run_scraper():
-        loop = asyncio.ProactorEventLoop()
+        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         async def _run():

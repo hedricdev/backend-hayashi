@@ -9,7 +9,12 @@ def _brl(v) -> str:
     return f"R$ {float(v or 0):,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 
-def gerar_pdf_fiado(cliente: str, vendas: list[VendaHistorico]) -> bytes:
+def gerar_pdf_fiado(
+    cliente: str,
+    vendas: list[VendaHistorico],
+    data_inicio: date | None = None,
+    data_fim: date | None = None,
+) -> bytes:
     """Gera um relatório em PDF com as vendas em aberto de um cliente,
     pronto pra ser enviado como cobrança."""
     pdf = FPDF(orientation="P", unit="mm", format="A4")
@@ -23,6 +28,10 @@ def gerar_pdf_fiado(cliente: str, vendas: list[VendaHistorico]) -> bytes:
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(100, 100, 100)
     pdf.cell(0, 6, f"Relatório de fiado em aberto - emitido em {date.today().strftime('%d/%m/%Y')}", ln=True)
+    if data_inicio or data_fim:
+        inicio_str = data_inicio.strftime("%d/%m/%Y") if data_inicio else "o início"
+        fim_str = data_fim.strftime("%d/%m/%Y") if data_fim else "hoje"
+        pdf.cell(0, 6, f"Período: {inicio_str} até {fim_str}", ln=True)
     pdf.ln(4)
 
     pdf.set_font("Helvetica", "B", 13)

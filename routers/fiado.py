@@ -63,13 +63,20 @@ class FiadoVenda(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _vendas_abertas_cliente(db: Session, nome: str) -> list[VendaHistorico]:
-    return (
-        db.query(VendaHistorico)
-        .filter(VendaHistorico.cliente == nome, VendaHistorico.valor_aberto > 0)
-        .order_by(VendaHistorico.data)
-        .all()
+def _vendas_abertas_cliente(
+    db: Session,
+    nome: str,
+    data_inicio: date | None = None,
+    data_fim: date | None = None,
+) -> list[VendaHistorico]:
+    query = db.query(VendaHistorico).filter(
+        VendaHistorico.cliente == nome, VendaHistorico.valor_aberto > 0
     )
+    if data_inicio:
+        query = query.filter(VendaHistorico.data >= data_inicio)
+    if data_fim:
+        query = query.filter(VendaHistorico.data <= data_fim)
+    return query.order_by(VendaHistorico.data).all()
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -152,13 +159,15 @@ def get_clientes(
 @router.get("/clientes/{nome}/vendas", response_model=list[FiadoVenda])
 def get_vendas_cliente(
     nome: str,
+    data_inicio: date | None = None,
+    data_fim: date | None = None,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _exigir_admin(current_user)
-    vendas = _vendas_abertas_cliente(db, nome)
+    vendas = _vendas_abertas_cliente(db, nome, data_inicio, data_fim)
     if not vendas:
-        raise HTTPException(404, "Nenhuma venda em aberto para esse cliente")
+        raise HTTPException(404, "Nenhuma venda em aberto para esse cliente no período")
     return [
         FiadoVenda(
             id=v.id,
@@ -175,16 +184,21 @@ def get_vendas_cliente(
 @router.get("/clientes/{nome}/pdf")
 def get_pdf_cliente(
     nome: str,
+    data_inicio: date | None = None,
+    data_fim: date | None = None,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _exigir_admin(current_user)
-    vendas = _vendas_abertas_cliente(db, nome)
+    vendas = _vendas_abertas_cliente(db, nome, data_inicio, data_fim)
     if not vendas:
-        raise HTTPException(404, "Nenhuma venda em aberto para esse cliente")
+        raise HTTPException(404, "Nenhuma venda em aberto para esse cliente no período")
 
-    pdf_bytes = gerar_pdf_fiado(nome, vendas)
-    filename = f"fiado-{nome}-{date.today().isoformat()}.pdf".replace(" ", "_")
+    pdf_bytes = gerar_pdf_fiado(nome, vendas, data_inicio=data_inicio, data_fim=data_fim)
+    sufixo_periodo = ""
+    if data_inicio or data_fim:
+        sufixo_periodo = f"-{data_inicio or 'inicio'}_a_{data_fim or 'hoje'}"
+    filename = f"fiado-{nome}{sufixo_periodo}-{date.today().isoformat()}.pdf".replace(" ", "_")
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",

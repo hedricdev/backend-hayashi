@@ -556,6 +556,84 @@ class IFrutiScraper:
             raise Exception(f"Requisição de exportação falhou: HTTP {resp.status}")
         return await resp.body()
 
+    # -------------------------------------------------------------------------
+    # Fluxo 4 — Lucro do período (Administrar Loja > Resultado > DRE)
+    # -------------------------------------------------------------------------
+
+    _RE_LUCRO_PERIODO = re.compile(
+        r"(?:Lucro|Preju[íi]zo) do per[íi]odo:\s*(-)?R\$\s*([\d.,]+)\s*\(([\-\d,]+|\?)%\)"
+    )
+
+    async def buscar_lucro_periodo(self, data_inicio: str, data_fim: str) -> dict:
+        """Lê o "Lucro do período" (ou "Prejuízo do período", quando negativo)
+        na tela Administrar Loja > Resultado > DRE. data_inicio/data_fim no
+        formato dd/mm/aaaa.
+
+        Essa tela não tem exportação — o valor só existe como texto renderizado
+        no resultado da consulta, por isso extraímos via regex do texto da
+        página em vez de bater num endpoint de exportação (diferente dos
+        outros fluxos de Distribuidora).
+
+        Preencher os inputs de data exige disparar os eventos que o datepicker
+        da tela escuta (change/changeDate/dp.change/blur via jQuery) — um
+        simples fill()+dispatch_event("change") não é suficiente aqui: o valor
+        aparece preenchido na tela mas é descartado pelo servidor ao consultar,
+        que devolve o período default (hoje-hoje) em vez do período pedido.
+
+        Quando o período não tem faturamento, o iFruti mostra a porcentagem
+        como "?" (evita divisão por zero) — nesse caso margem_pct volta None.
+        """
+        page = self._page
+
+        # Logo após o login, a página do painel pode ainda não ter terminado
+        # de carregar seus scripts (jQuery incluso) — aguarda antes de mexer
+        # nos menus pra evitar corrida.
+        await page.wait_for_function("() => !!(window.jQuery || window.$)", timeout=15000)
+
+        await page.click("a:has(i.fa-building)")
+        await page.wait_for_timeout(800)
+        await page.wait_for_selector("a:has-text('Resultado')", state="visible", timeout=5000)
+        await page.click("a:has-text('Resultado')")
+        await page.wait_for_timeout(800)
+        await page.wait_for_selector("#menu_grpDre", state="visible", timeout=5000)
+        await page.click("#menu_grpDre")
+        await page.wait_for_selector("#dtPeriodoIni", state="visible", timeout=15000)
+        # #menu_grpDre navega pra uma URL nova (recarrega a página) — o HTML
+        # estático chega antes do script do jQuery terminar de carregar.
+        await page.wait_for_function("() => !!(window.jQuery || window.$)", timeout=15000)
+
+        resultado = await page.evaluate(
+            """([ini, fim]) => {
+                const jq = window.jQuery || window.$;
+                if (!jq) return 'ERR:jQuery não encontrado';
+                jq('#dtPeriodoIni').val(ini).trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                jq('#dtPeriodoFim').val(fim).trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                return 'OK';
+            }""",
+            [data_inicio, data_fim],
+        )
+        if resultado != "OK":
+            raise Exception(resultado.replace("ERR:", "", 1))
+
+        await page.wait_for_selector("#btnPeriodo", state="visible", timeout=15000)
+        await page.click("#btnPeriodo")
+        await page.wait_for_function(
+            "() => document.body.innerText.includes('do período:')",
+            timeout=20000,
+        )
+
+        texto = await page.evaluate("() => document.body.innerText")
+        match = self._RE_LUCRO_PERIODO.search(texto)
+        if not match:
+            raise Exception("Não foi possível encontrar 'Lucro do período' no resultado do DRE")
+
+        sinal_str, valor_str, pct_str = match.groups()
+        sinal = -1 if sinal_str == "-" else 1
+        lucro = sinal * float(valor_str.replace(".", "").replace(",", "."))
+        margem_pct = None if pct_str == "?" else float(pct_str.replace(",", "."))
+
+        return {"lucro": round(lucro, 2), "margem_pct": margem_pct}
+
     async def _preencher_form_venda(
         self, cliente: str, produto: str, quantidade: int, valor: str,
         salvar: bool = True,

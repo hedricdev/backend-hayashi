@@ -1,18 +1,25 @@
-from datetime import datetime
+import asyncio
+import calendar
+import threading
+from datetime import date, datetime
 from typing import Annotated, Optional
 
 import pytz
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import distinct, func
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import get_db
+from models.importacao import Importacao
 from models.meta_mensal import MetaMensal
 from models.usuario import Role, Usuario
 from models.venda_historico import VendaHistorico
 from models.venda_semana import VendaSemana
+from services.scraping import IFrutiScraper
+from services.sse_log import build_sse_runner, importacao_to_dict, make_stream, salvar_no_banco
 
 router = APIRouter()
 
@@ -57,6 +64,8 @@ class MetaStatus(BaseModel):
     meta: float
     supermeta: float
     faturamento: float
+    lucro: Optional[float] = None
+    usa_lucro: bool
     pct_meta: float
     pct_supermeta: float
     status: str         # "abaixo_meta" | "meta" | "supermeta"
@@ -140,6 +149,100 @@ def get_meta_atual(
     )
 
 
+@router.post("/lucro/sync")
+def sync_lucro(
+    current_user: Annotated[Usuario, Depends(get_current_user)],
+    mes: str,
+    db: Session = Depends(get_db),
+):
+    """Sincroniza o lucro do mês sob demanda: login no iFruti, lê o "Lucro do
+    período" na tela Administrar Loja > Resultado > DRE e grava na meta do mês.
+    """
+    if current_user.role != Role.admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores")
+
+    row = db.query(MetaMensal).filter(MetaMensal.mes == mes).first()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Cadastre a meta desse mês antes de sincronizar o lucro",
+        )
+
+    brasilia = pytz.timezone("America/Sao_Paulo")
+    mes_atual = datetime.now(brasilia).strftime("%Y-%m")
+    ano, m = int(mes[:4]), int(mes[5:])
+    primeiro_dia = date(ano, m, 1)
+    ultimo_dia = (
+        datetime.now(brasilia).date()
+        if mes == mes_atual
+        else date(ano, m, calendar.monthrange(ano, m)[1])
+    )
+    data_inicio = primeiro_dia.strftime("%d/%m/%Y")
+    data_fim = ultimo_dia.strftime("%d/%m/%Y")
+
+    msg_queue, messages, iniciado_em, put = build_sse_runner()
+
+    def run_scraper():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def _run():
+            try:
+                put(f"Buscando lucro de {data_inicio} até {data_fim}...")
+                async with IFrutiScraper(debug=True) as scraper:
+                    put("Login no iFruti...")
+                    resultado = await scraper.buscar_lucro_periodo(data_inicio, data_fim)
+
+                from database import SessionLocal
+                sync_db = SessionLocal()
+                try:
+                    linha = sync_db.query(MetaMensal).filter(MetaMensal.mes == mes).first()
+                    if linha:
+                        linha.lucro = resultado["lucro"]
+                        linha.lucro_margem_pct = resultado["margem_pct"]
+                        linha.lucro_atualizado_em = datetime.utcnow()
+                        sync_db.commit()
+                finally:
+                    sync_db.close()
+
+                margem = resultado["margem_pct"]
+                margem_str = f"{margem:.2f}%".replace(".", ",") if margem is not None else "—"
+                lucro_str = f"{resultado['lucro']:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+                put(f"✓ Lucro do período: R$ {lucro_str} ({margem_str})")
+            except Exception as e:
+                put(f"ERRO: {e}")
+            finally:
+                msg_queue.put(None)
+
+        loop.run_until_complete(_run())
+        loop.close()
+        salvar_no_banco(messages, iniciado_em, "lucro_sync")
+
+    threading.Thread(target=run_scraper, daemon=True).start()
+
+    return StreamingResponse(
+        make_stream(msg_queue),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/lucro/sync/ultimo-log")
+def get_ultimo_log_sync_lucro(
+    current_user: Annotated[Usuario, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    importacao = (
+        db.query(Importacao)
+        .filter(Importacao.tipo == "lucro_sync")
+        .order_by(Importacao.id.desc())
+        .first()
+    )
+    if not importacao:
+        return {"log": None}
+    return importacao_to_dict(importacao)
+
+
 @router.get("/vendedores", response_model=ContribuicaoResponse)
 def get_contribuicao_vendedores(
     _: Annotated[Usuario, Depends(get_current_user)],
@@ -152,8 +255,6 @@ def get_contribuicao_vendedores(
 
     # Primeiro dia e último dia do mês
     ano, m = int(mes[:4]), int(mes[5:])
-    from datetime import date
-    import calendar
     primeiro_dia = date(ano, m, 1)
     ultimo_dia = date(ano, m, calendar.monthrange(ano, m)[1])
 
@@ -198,12 +299,16 @@ def get_contribuicao_vendedores(
 def _build_status(row: MetaMensal, faturamento: float) -> MetaStatus:
     meta = _f(row.meta)
     supermeta = _f(row.supermeta)
-    pct_meta = round((faturamento / meta * 100) if meta > 0 else 0, 1)
-    pct_supermeta = round((faturamento / supermeta * 100) if supermeta > 0 else 0, 1)
 
-    if faturamento >= supermeta:
+    usa_lucro = row.lucro is not None
+    valor = _f(row.lucro) if usa_lucro else faturamento
+
+    pct_meta = round((valor / meta * 100) if meta > 0 else 0, 1)
+    pct_supermeta = round((valor / supermeta * 100) if supermeta > 0 else 0, 1)
+
+    if valor >= supermeta:
         status = "supermeta"
-    elif faturamento >= meta:
+    elif valor >= meta:
         status = "meta"
     else:
         status = "abaixo_meta"
@@ -221,8 +326,10 @@ def _build_status(row: MetaMensal, faturamento: float) -> MetaStatus:
         meta=meta,
         supermeta=supermeta,
         faturamento=faturamento,
+        lucro=_f(row.lucro) if usa_lucro else None,
+        usa_lucro=usa_lucro,
         pct_meta=pct_meta,
         pct_supermeta=pct_supermeta,
         status=status,
-        tem_dados_ifruti=faturamento > 0,
+        tem_dados_ifruti=usa_lucro or faturamento > 0,
     )

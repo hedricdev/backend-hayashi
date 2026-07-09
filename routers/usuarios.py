@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from auth import hash_password, require_admin
@@ -104,3 +105,25 @@ def atualizar_usuario(
     db.commit()
     db.refresh(usuario)
     return usuario
+
+
+@router.delete("/{usuario_id}", status_code=status.HTTP_204_NO_CONTENT)
+def excluir_usuario(
+    usuario_id: int,
+    current_user: Annotated[Usuario, Depends(require_admin)],
+    db: Session = Depends(get_db),
+):
+    if usuario_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Não é possível excluir sua própria conta")
+    usuario = db.query(Usuario).filter(Usuario.id == usuario_id).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    try:
+        db.delete(usuario)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Não é possível excluir: este usuário tem registros vinculados (ex: clientes atribuídos)",
+        )

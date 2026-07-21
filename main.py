@@ -15,6 +15,7 @@ from routers import fiado as fiado_router
 from routers import despesas as despesas_router
 from routers import compras as compras_router
 from routers import fluxo_caixa as fluxo_caixa_router
+from routers import margem as margem_router
 from routers import sync as sync_router
 
 app = FastAPI(title="Hayashi API", version="1.0.0")
@@ -41,6 +42,7 @@ app.include_router(despesas_router.router, prefix="/despesas", tags=["despesas"]
 app.include_router(compras_router.router, prefix="/compras", tags=["compras"])
 app.include_router(fluxo_caixa_router.router, prefix="/fluxo-caixa", tags=["fluxo-caixa"])
 app.include_router(sync_router.router, prefix="/sync", tags=["sync"])
+app.include_router(margem_router.router, prefix="/margem", tags=["margem"])
 
 
 @app.on_event("startup")

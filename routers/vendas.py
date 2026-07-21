@@ -1,6 +1,6 @@
 import calendar as _cal
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Annotated
 
 import pytz
@@ -297,27 +297,19 @@ _MES_PT = {
 }
 
 
-@router.get("/mensal", response_model=VendasResponse)
-def get_vendas_mensal(
-    current_user: Annotated[Usuario, Depends(get_current_user)],
-    db: Session = Depends(get_db),
-):
-    """
-    Dados do mês atual.
-    Fonte principal: vendas_historico (iFruti) — completo e confiável.
-    Ranking de vendedores: vendas_semana (planilha) — única fonte com info de vendedor.
-    """
-    brasilia = pytz.timezone("America/Sao_Paulo")
-    hoje = datetime.now(brasilia)
-    ano, mes = hoje.year, hoje.month
-    primeiro_dia = date(ano, mes, 1)
-    ultimo_dia = date(ano, mes, _cal.monthrange(ano, mes)[1])
-    dia_atual_str = _DIAS_SEMANA[hoje.weekday()]
+def _agrega_periodo_ifruti(db: Session, data_inicio: date, data_fim: date) -> dict:
+    """Agrega vendas_historico (iFruti) num intervalo de datas qualquer no
+    mesmo formato usado pelo Dashboard — vendas, ranking de clientes,
+    produtos, caixas por dia, mix de pagamento e ticket médio por grupo.
 
-    # ── Dados principais: iFruti ──────────────────────────────────────────────
+    Usado tanto por /mensal (intervalo = mês atual) quanto por /semana-atual
+    (intervalo = semana atual, segunda a sábado). Não inclui ranking de
+    vendedores nem comparativo — cada endpoint monta essas partes por cima,
+    já que só /mensal tem as duas.
+    """
     hist_rows = (
         db.query(VendaHistorico)
-        .filter(VendaHistorico.data >= primeiro_dia, VendaHistorico.data <= ultimo_dia)
+        .filter(VendaHistorico.data >= data_inicio, VendaHistorico.data <= data_fim)
         .order_by(VendaHistorico.data, VendaHistorico.cliente, VendaHistorico.produto)
         .all()
     )
@@ -392,40 +384,6 @@ def get_vendas_mensal(
         if aberto > 0:
             vendas_em_aberto.append(venda_obj)
 
-    # ── Ranking vendedores: planilha (única fonte com info de vendedor) ────────
-    semana_rows = (
-        db.query(
-            VendaSemana.vendedor,
-            func.sum(VendaSemana.quantidade).label("caixas"),
-            func.sum(VendaSemana.faturamento_estimado).label("fat"),
-        )
-        .filter(VendaSemana.data >= primeiro_dia, VendaSemana.data <= ultimo_dia)
-        .group_by(VendaSemana.vendedor)
-        .all()
-    )
-    txn_subq = (
-        db.query(VendaSemana.vendedor, VendaSemana.data, VendaSemana.cliente)
-        .filter(VendaSemana.data >= primeiro_dia, VendaSemana.data <= ultimo_dia)
-        .distinct()
-        .subquery()
-    )
-    txn_map = {
-        r.vendedor: r.vendas
-        for r in db.query(txn_subq.c.vendedor, func.count().label("vendas"))
-        .group_by(txn_subq.c.vendedor)
-        .all()
-    }
-    ranking_v_list = [
-        RankingVendedor(
-            nome=r.vendedor,
-            total_caixas=int(r.caixas or 0),
-            total_vendas=txn_map.get(r.vendedor, 0),
-            faturamento_estimado=round(float(r.fat or 0), 2),
-        )
-        for r in sorted(semana_rows, key=lambda x: x.caixas or 0, reverse=True)
-    ]
-
-    # ── Monta resposta ─────────────────────────────────────────────────────────
     ranking_c_list = [
         RankingCliente(
             nome=c["nome"],
@@ -461,6 +419,75 @@ def get_vendas_mensal(
             )
             for g in sorted(agg.values(), key=lambda x: x["faturamento"], reverse=True)
         ]
+
+    return {
+        "hist_rows": hist_rows,
+        "total_caixas": total_caixas,
+        "faturamento_total": faturamento_total,
+        "vendas": vendas_out,
+        "vendas_em_aberto": vendas_em_aberto,
+        "ranking_clientes": ranking_c_list,
+        "produtos_mais_vendidos": produtos_list,
+        "caixas_por_dia": caixas_dia_list,
+        "mix_pagamento": mix_out,
+        "ticket_por_categoria": _ticket_list(ticket_cat),
+        "ticket_por_fornecedor": _ticket_list(ticket_forn),
+    }
+
+
+@router.get("/mensal", response_model=VendasResponse)
+def get_vendas_mensal(
+    current_user: Annotated[Usuario, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    """
+    Dados do mês atual.
+    Fonte principal: vendas_historico (iFruti) — completo e confiável.
+    Ranking de vendedores: vendas_semana (planilha) — única fonte com info de vendedor.
+    """
+    brasilia = pytz.timezone("America/Sao_Paulo")
+    hoje = datetime.now(brasilia)
+    ano, mes = hoje.year, hoje.month
+    primeiro_dia = date(ano, mes, 1)
+    ultimo_dia = date(ano, mes, _cal.monthrange(ano, mes)[1])
+    dia_atual_str = _DIAS_SEMANA[hoje.weekday()]
+
+    agregado = _agrega_periodo_ifruti(db, primeiro_dia, ultimo_dia)
+    hist_rows = agregado["hist_rows"]
+    faturamento_total = agregado["faturamento_total"]
+
+    # ── Ranking vendedores: planilha (única fonte com info de vendedor) ────────
+    semana_rows = (
+        db.query(
+            VendaSemana.vendedor,
+            func.sum(VendaSemana.quantidade).label("caixas"),
+            func.sum(VendaSemana.faturamento_estimado).label("fat"),
+        )
+        .filter(VendaSemana.data >= primeiro_dia, VendaSemana.data <= ultimo_dia)
+        .group_by(VendaSemana.vendedor)
+        .all()
+    )
+    txn_subq = (
+        db.query(VendaSemana.vendedor, VendaSemana.data, VendaSemana.cliente)
+        .filter(VendaSemana.data >= primeiro_dia, VendaSemana.data <= ultimo_dia)
+        .distinct()
+        .subquery()
+    )
+    txn_map = {
+        r.vendedor: r.vendas
+        for r in db.query(txn_subq.c.vendedor, func.count().label("vendas"))
+        .group_by(txn_subq.c.vendedor)
+        .all()
+    }
+    ranking_v_list = [
+        RankingVendedor(
+            nome=r.vendedor,
+            total_caixas=int(r.caixas or 0),
+            total_vendas=txn_map.get(r.vendedor, 0),
+            faturamento_estimado=round(float(r.fat or 0), 2),
+        )
+        for r in sorted(semana_rows, key=lambda x: x.caixas or 0, reverse=True)
+    ]
 
     # ── Comparativo dia a dia com o mês anterior ────────────────────────────────
     if mes == 1:
@@ -504,20 +531,58 @@ def get_vendas_mensal(
     )
 
     return VendasResponse(
-        vendas=vendas_out,
+        vendas=agregado["vendas"],
         resumo=Resumo(
-            total_caixas=total_caixas,
-            total_vendas=len(vendas_out),
+            total_caixas=agregado["total_caixas"],
+            total_vendas=len(agregado["vendas"]),
             faturamento_estimado=round(faturamento_total, 2),
         ),
         ranking_vendedores=ranking_v_list,
-        ranking_clientes=ranking_c_list,
-        produtos_mais_vendidos=produtos_list,
-        caixas_por_dia=caixas_dia_list,
-        mix_pagamento=mix_out,
-        vendas_em_aberto=vendas_em_aberto,
-        ticket_por_categoria=_ticket_list(ticket_cat),
-        ticket_por_fornecedor=_ticket_list(ticket_forn),
+        ranking_clientes=agregado["ranking_clientes"],
+        produtos_mais_vendidos=agregado["produtos_mais_vendidos"],
+        caixas_por_dia=agregado["caixas_por_dia"],
+        mix_pagamento=agregado["mix_pagamento"],
+        vendas_em_aberto=agregado["vendas_em_aberto"],
+        ticket_por_categoria=agregado["ticket_por_categoria"],
+        ticket_por_fornecedor=agregado["ticket_por_fornecedor"],
         dia_atual=dia_atual_str,
         comparativo_mensal=comparativo,
+    )
+
+
+@router.get("/semana-atual", response_model=VendasResponse)
+def get_vendas_semana_atual(
+    current_user: Annotated[Usuario, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    """
+    Dados da semana corrente (segunda a sábado), mesma fonte que /mensal:
+    vendas_historico (iFruti) — substitui a antiga leitura direta da
+    planilha ao vivo. Ranking de vendedores fica vazio (iFruti ainda não
+    tem esse campo — mesmo motivo que já oculta o widget no Dashboard).
+    """
+    brasilia = pytz.timezone("America/Sao_Paulo")
+    hoje = datetime.now(brasilia).date()
+    segunda = hoje - timedelta(days=hoje.weekday())
+    sabado = segunda + timedelta(days=5)
+    dia_atual_str = _DIAS_SEMANA[hoje.weekday()]
+
+    agregado = _agrega_periodo_ifruti(db, segunda, sabado)
+
+    return VendasResponse(
+        vendas=agregado["vendas"],
+        resumo=Resumo(
+            total_caixas=agregado["total_caixas"],
+            total_vendas=len(agregado["vendas"]),
+            faturamento_estimado=round(agregado["faturamento_total"], 2),
+        ),
+        ranking_vendedores=[],
+        ranking_clientes=agregado["ranking_clientes"],
+        produtos_mais_vendidos=agregado["produtos_mais_vendidos"],
+        caixas_por_dia=agregado["caixas_por_dia"],
+        mix_pagamento=agregado["mix_pagamento"],
+        vendas_em_aberto=agregado["vendas_em_aberto"],
+        ticket_por_categoria=agregado["ticket_por_categoria"],
+        ticket_por_fornecedor=agregado["ticket_por_fornecedor"],
+        dia_atual=dia_atual_str,
     )

@@ -1,3 +1,5 @@
+from datetime import date
+
 from sqlalchemy.orm import Session
 
 from models.venda_historico import VendaHistorico
@@ -24,7 +26,10 @@ def reconciliar_fiado(db: Session, rows: list[dict]) -> tuple[int, int, int]:
        NÃO aparece nesse snapshot foi paga (o iFruti só lista quem ainda
        deve) — zera o valor_aberto. Sem isso, fiado antigo fica preso aberto
        pra sempre, já que o sync por período (exportar_vendas_periodo) só
-       cobre uma janela recente de datas.
+       cobre uma janela recente de datas. A data exata do pagamento não é
+       capturada por esse caminho — grava data.today() em data_recebimento
+       como aproximação (só sabemos que foi pago em algum momento entre o
+       último sync e agora).
 
     Retorna (novos, atualizados, quitados).
     """
@@ -38,6 +43,7 @@ def reconciliar_fiado(db: Session, rows: list[dict]) -> tuple[int, int, int]:
     for venda in abertos_no_banco:
         if _chave_venda(venda) not in chaves_abertas:
             venda.valor_aberto = 0
+            venda.data_recebimento = date.today()
             quitados += 1
 
     if quitados:

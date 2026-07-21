@@ -634,6 +634,232 @@ class IFrutiScraper:
 
         return {"lucro": round(lucro, 2), "margem_pct": margem_pct}
 
+    # -------------------------------------------------------------------------
+    # Fluxo 5 — Exportação de despesas por período (Financeiro > Despesas)
+    # -------------------------------------------------------------------------
+
+    async def _navegar_despesas(self):
+        """Abre Administrar Loja > Financeiro > Despesas e aguarda o form carregar.
+
+        Depois de consultar uma vez, a própria tela de resultado troca o menu
+        de topo por um link "Voltar" (some o "Administrar Loja") — então, se
+        o form de Despesas já estiver na página (ex: uma segunda consulta na
+        mesma sessão, pra combinar período + em aberto), não precisa navegar
+        de novo pelos menus, só reaproveita a tela atual.
+        """
+        page = self._page
+        if await page.query_selector("#dataInicial"):
+            return
+
+        await page.wait_for_function("() => !!(window.jQuery || window.$)", timeout=15000)
+
+        await page.click("a:has(i.fa-building)")
+        await page.wait_for_timeout(800)
+        await page.wait_for_selector("a:has-text('Financeiro')", state="visible", timeout=5000)
+        await page.click("a:has-text('Financeiro')")
+        await page.wait_for_timeout(800)
+        await page.wait_for_selector("#menu_grpDespesas", state="visible", timeout=5000)
+        await page.click("#menu_grpDespesas")
+        await page.wait_for_selector("#dataInicial", state="attached", timeout=15000)
+        await page.wait_for_function("() => !!(window.jQuery || window.$)", timeout=15000)
+
+    async def _consultar_despesas_exportar(self) -> bytes:
+        """Clica #btnDespesas (já com os filtros preenchidos) e baixa o Excel.
+
+        O botão "Exportar para Excel" (#btnDespesasXls) dispara um download
+        direto (não uma aba que renderiza HTML) para
+        AdminGrupo?opcao=getDespesasXls — batemos direto nesse endpoint
+        reaproveitando os cookies de sessão do contexto, mesmo padrão de
+        exportar_vendas_periodo.
+        """
+        page = self._page
+        await page.wait_for_selector("#btnDespesas", state="visible", timeout=15000)
+        await page.click("#btnDespesas")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        resp = await self._context.request.get(
+            f"{settings.IFRUTI_URL}/AdminGrupo",
+            params={"opcao": "getDespesasXls"},
+        )
+        if not resp.ok:
+            raise Exception(f"Requisição de exportação falhou: HTTP {resp.status}")
+        return await resp.body()
+
+    async def exportar_despesas_periodo(self, data_inicio: str, data_fim: str) -> bytes:
+        """Exporta a tela Financeiro > Despesas num período. data_inicio/
+        data_fim no formato dd/mm/aaaa.
+
+        Preencher #dataInicial/#dataFinal exige a mesma cadeia de eventos
+        jQuery da tela do DRE (change/changeDate/dp.change/blur) — mesmo
+        motivo documentado em buscar_lucro_periodo.
+
+        Retorna os bytes do .xls (HTML, mesmo formato que parse_despesas_xls
+        já sabe ler).
+        """
+        page = self._page
+        await self._navegar_despesas()
+
+        resultado = await page.evaluate(
+            """([ini, fim]) => {
+                const jq = window.jQuery || window.$;
+                if (!jq) return 'ERR:jQuery não encontrado';
+                jq('#dataInicial').val(ini).trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                jq('#dataFinal').val(fim).trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                return 'OK';
+            }""",
+            [data_inicio, data_fim],
+        )
+        if resultado != "OK":
+            raise Exception(resultado.replace("ERR:", "", 1))
+
+        return await self._consultar_despesas_exportar()
+
+    async def exportar_despesas_em_aberto(self) -> bytes:
+        """Exporta TODAS as despesas atualmente em aberto, sem depender de
+        uma janela de datas.
+
+        Diferente da tela de Distribuidora (onde selecionar "Em Aberto"
+        trava/ignora o filtro de data), a tela de Despesas combina os dois
+        filtros: selecionar #situacao=1 sozinho só devolve os itens em
+        aberto DENTRO do período de datas já preenchido (por padrão,
+        hoje-hoje). Por isso aqui preenchemos também uma data inicial bem
+        antiga (01/01/2000) até hoje, além de #situacao=1 — confirmado ao
+        vivo que a combinação dos dois devolve o total real em aberto da
+        conta (bate com o rodapé "Vlr. Aberto" da tela).
+
+        Permite reconciliar despesas antigas que só foram pagas bem depois
+        da janela de sincronização por período (mesmo problema que
+        reconciliar_fiado resolve pra vendas).
+        """
+        page = self._page
+        await self._navegar_despesas()
+
+        hoje = datetime.now(FUSO).strftime("%d/%m/%Y")
+        resultado = await page.evaluate(
+            """([fim]) => {
+                const jq = window.jQuery || window.$;
+                if (!jq) return 'ERR:jQuery não encontrado';
+                const sel = document.querySelector('#situacao');
+                if (!sel) return 'ERR:select situacao não encontrado';
+                sel.value = '1';
+                jq(sel).trigger('change');
+                jq('#dataInicial').val('01/01/2000').trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                jq('#dataFinal').val(fim).trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                return 'OK';
+            }""",
+            [hoje],
+        )
+        if resultado != "OK":
+            raise Exception(resultado.replace("ERR:", "", 1))
+
+        return await self._consultar_despesas_exportar()
+
+    # -------------------------------------------------------------------------
+    # Fluxo 6 — Exportação de compras (Mercadorias > Compras)
+    # -------------------------------------------------------------------------
+
+    async def _navegar_compras(self):
+        """Abre Administrar Loja > Mercadorias > Compras e aguarda o form
+        carregar. Mesma proteção de _navegar_despesas: se o form já estiver
+        na página (2ª consulta na mesma sessão), pula a navegação por menu.
+        """
+        page = self._page
+        if await page.query_selector("#dataInicial"):
+            return
+
+        await page.wait_for_function("() => !!(window.jQuery || window.$)", timeout=15000)
+
+        await page.click("a:has(i.fa-building)")
+        await page.wait_for_timeout(800)
+        await page.wait_for_selector("a:has-text('Mercadorias')", state="visible", timeout=5000)
+        await page.click("a:has-text('Mercadorias')")
+        await page.wait_for_timeout(800)
+        await page.wait_for_selector("#menu_grpCompras", state="visible", timeout=5000)
+        await page.click("#menu_grpCompras")
+        await page.wait_for_selector("#dataInicial", state="attached", timeout=15000)
+        await page.wait_for_function("() => !!(window.jQuery || window.$)", timeout=15000)
+
+    async def _consultar_compras_exportar(self) -> bytes:
+        """Clica #btnCompras (já com os filtros preenchidos) e baixa o Excel.
+
+        A URL certa é AdminGrupo?opcao=getComprasXls (com "s" em Compras —
+        confirmado capturando o evento de download real do botão; um
+        primeiro palpite sem o "s" retorna a página de login).
+        """
+        page = self._page
+        await page.wait_for_selector("#btnCompras", state="visible", timeout=15000)
+        await page.click("#btnCompras")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        resp = await self._context.request.get(
+            f"{settings.IFRUTI_URL}/AdminGrupo",
+            params={"opcao": "getComprasXls"},
+        )
+        if not resp.ok:
+            raise Exception(f"Requisição de exportação falhou: HTTP {resp.status}")
+        return await resp.body()
+
+    async def exportar_compras_periodo(self, data_inicio: str, data_fim: str) -> bytes:
+        """Exporta a tela Mercadorias > Compras num período. data_inicio/
+        data_fim no formato dd/mm/aaaa.
+
+        Retorna os bytes do .xls (HTML, mesmo formato que
+        parse_compras_xls já sabe ler).
+        """
+        page = self._page
+        await self._navegar_compras()
+
+        resultado = await page.evaluate(
+            """([ini, fim]) => {
+                const jq = window.jQuery || window.$;
+                if (!jq) return 'ERR:jQuery não encontrado';
+                jq('#dataInicial').val(ini).trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                jq('#dataFinal').val(fim).trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                return 'OK';
+            }""",
+            [data_inicio, data_fim],
+        )
+        if resultado != "OK":
+            raise Exception(resultado.replace("ERR:", "", 1))
+
+        return await self._consultar_compras_exportar()
+
+    async def exportar_compras_em_aberto(self) -> bytes:
+        """Exporta TODAS as compras atualmente em aberto, sem depender de
+        uma janela de datas — mesmo raciocínio de exportar_despesas_em_aberto:
+        selecionar #situacao=1 sozinho só devolve os itens em aberto DENTRO
+        do período já preenchido, por isso combina com uma data inicial
+        bem antiga (01/01/2000) até hoje. Confirmado ao vivo.
+        """
+        page = self._page
+        await self._navegar_compras()
+
+        hoje = datetime.now(FUSO).strftime("%d/%m/%Y")
+        resultado = await page.evaluate(
+            """([fim]) => {
+                const jq = window.jQuery || window.$;
+                if (!jq) return 'ERR:jQuery não encontrado';
+                const sel = document.querySelector('#situacao');
+                if (!sel) return 'ERR:select situacao não encontrado';
+                sel.value = '1';
+                jq(sel).trigger('change');
+                jq('#dataInicial').val('01/01/2000').trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                jq('#dataFinal').val(fim).trigger('change').trigger('changeDate').trigger('dp.change').trigger('blur');
+                return 'OK';
+            }""",
+            [hoje],
+        )
+        if resultado != "OK":
+            raise Exception(resultado.replace("ERR:", "", 1))
+
+        return await self._consultar_compras_exportar()
+
     async def _preencher_form_venda(
         self, cliente: str, produto: str, quantidade: int, valor: str,
         salvar: bool = True,

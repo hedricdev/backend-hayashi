@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 480  # 8 horas
 
+    AUTO_SYNC_ENABLED: bool = True
+    AUTO_SYNC_INTERVALO_SEGUNDOS: int = 3600  # 1h
+
     class Config:
         env_file = ".env"
         extra = "ignore"
